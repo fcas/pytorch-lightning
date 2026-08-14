@@ -1,12 +1,13 @@
-import lightning as L
 import torch
 import torch.nn.functional as F
 from data import RandomTokenDataset
-from lightning.fabric.strategies import ModelParallelStrategy
 from model import ModelArgs, Transformer
 from parallelism import parallelize
 from torch.distributed.tensor.parallel import loss_parallel
 from torch.utils.data import DataLoader
+
+import lightning as L
+from lightning.fabric.strategies import ModelParallelStrategy
 
 
 def train():
@@ -57,8 +58,8 @@ def train():
 
         with loss_parallel():
             loss = F.cross_entropy(output.reshape(-1, output.size(-1)), labels.reshape(-1))
+            fabric.backward(loss)
 
-        fabric.backward(loss)
         optimizer.step()
         optimizer.zero_grad()
         fabric.print(f"Iteration {i} complete")
@@ -66,10 +67,10 @@ def train():
     # See `fabric consolidate --help` if you need to convert the checkpoint to a single file
     fabric.print("Saving a (distributed) checkpoint ...")
     state = {"model": model, "optimizer": optimizer, "iteration": i}
-    fabric.save("checkpoint.pt", state)
+    fabric.save(path="checkpoint.pt", state=state)
 
     fabric.print("Training successfully completed!")
-    fabric.print(f"Peak memory usage: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+    fabric.print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 
 if __name__ == "__main__":

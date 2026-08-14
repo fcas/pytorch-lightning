@@ -19,29 +19,23 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
+from torch.optim import Adam
+
 from lightning.fabric.plugins.environments import LightningEnvironment
 from lightning.fabric.strategies import ModelParallelStrategy
 from lightning.fabric.strategies.fsdp import _is_sharded_checkpoint
 from lightning.fabric.strategies.model_parallel import _ParallelBackwardSyncControl
-from torch.optim import Adam
-
 from tests_fabric.helpers.runif import RunIf
 
 
-@mock.patch("lightning.fabric.strategies.model_parallel._TORCH_GREATER_EQUAL_2_3", False)
-def test_torch_greater_equal_2_3():
-    with pytest.raises(ImportError, match="ModelParallelStrategy requires PyTorch 2.3 or higher"):
-        ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
-
-
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_device_mesh_access():
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
     with pytest.raises(RuntimeError, match="Accessing the device mesh .* not allowed"):
         _ = strategy.device_mesh
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 @pytest.mark.parametrize(
     ("num_nodes", "devices", "invalid_dp_size", "invalid_tp_size"),
     [
@@ -70,7 +64,7 @@ def test_validate_device_mesh_dimensions(num_nodes, devices, invalid_dp_size, in
         strategy.setup_environment()
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_checkpoint_io_unsupported():
     """Test that the ModelParallel strategy does not support the `CheckpointIO` plugin."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
@@ -81,18 +75,18 @@ def test_checkpoint_io_unsupported():
         strategy.checkpoint_io = Mock()
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_fsdp_v1_modules_unsupported():
     """Test that the strategy won't allow setting up a module wrapped with the legacy FSDP API."""
     from torch.distributed.fsdp import FullyShardedDataParallel
 
     module = Mock(modules=Mock(return_value=[Mock(spec=FullyShardedDataParallel)]))
     strategy = ModelParallelStrategy(parallelize_fn=(lambda x, _: x))
-    with pytest.raises(TypeError, match="only supports the new FSDP2 APIs in PyTorch >= 2.3"):
+    with pytest.raises(TypeError, match="only supports the new FSDP2 APIs in PyTorch >= 2.4"):
         strategy.setup_module(module)
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_parallelize_fn_call():
     model = nn.Linear(2, 2)
     optimizer = Adam(model.parameters())
@@ -102,7 +96,7 @@ def test_parallelize_fn_call():
     strategy = ModelParallelStrategy(parallelize_fn=parallelize_fn)
     strategy._device_mesh = Mock()
     strategy.parallel_devices = [torch.device("cpu")]
-    model_setup, [optimizer_setup] = strategy.setup_module_and_optimizers(model, [optimizer])
+    model_setup, [optimizer_setup], _ = strategy.setup_module_and_optimizers(model, [optimizer])
     assert model_setup is parallel_model_mock
     assert optimizer_setup is optimizer
     parallelize_fn.assert_called_with(model, strategy.device_mesh)
@@ -116,15 +110,15 @@ def test_parallelize_fn_call():
         strategy.setup_module_and_optimizers(model, [optimizer])
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_no_backward_sync():
     """Test that the backward sync control disables gradient sync on modules that benefit from it."""
-    from torch.distributed._composable.fsdp import FSDP
+    from torch.distributed._composable.fsdp import FSDPModule
 
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
     assert isinstance(strategy._backward_sync_control, _ParallelBackwardSyncControl)
 
-    fsdp_layer = Mock(spec=FSDP)
+    fsdp_layer = Mock(spec=FSDPModule)
     other_layer = nn.Linear(2, 2)
     module = Mock()
     module.modules = Mock(return_value=[fsdp_layer, other_layer])
@@ -138,7 +132,7 @@ def test_no_backward_sync():
     fsdp_layer.set_requires_gradient_sync.assert_called_with(False, recurse=False)
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_save_checkpoint_storage_options(tmp_path):
     """Test that the strategy does not accept storage options for saving checkpoints."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
@@ -148,14 +142,14 @@ def test_save_checkpoint_storage_options(tmp_path):
         strategy.save_checkpoint(path=tmp_path, state=Mock(), storage_options=Mock())
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 @mock.patch("lightning.fabric.strategies.model_parallel.ModelParallelStrategy.broadcast", lambda _, x: x)
 @mock.patch("lightning.fabric.strategies.model_parallel._has_dtensor_modules", return_value=True)
 @mock.patch("torch.distributed.checkpoint.state_dict.get_model_state_dict", return_value={})
 @mock.patch("torch.distributed.checkpoint.state_dict.get_optimizer_state_dict", return_value={})
-@mock.patch("lightning.fabric.strategies.model_parallel.torch.save")
-@mock.patch("lightning.fabric.strategies.model_parallel.shutil")
-def test_save_checkpoint_path_exists(shutil_mock, torch_save_mock, _, __, ___, tmp_path):
+@mock.patch("lightning.fabric.strategies.model_parallel._atomic_save")
+@mock.patch("lightning.fabric.strategies.model_parallel._remove_checkpoint")
+def test_save_checkpoint_path_exists(remove_checkpoint_mock, atomic_save_mock, _, __, ___, tmp_path):
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m), save_distributed_checkpoint=False)
 
     # save_distributed_checkpoint=False, path exists, path is not a sharded checkpoint: error
@@ -174,15 +168,15 @@ def test_save_checkpoint_path_exists(shutil_mock, torch_save_mock, _, __, ___, t
     model = Mock()
     model.modules.return_value = [model]
     strategy.save_checkpoint(path=path, state={"model": model})
-    shutil_mock.rmtree.assert_called_once_with(path)
+    remove_checkpoint_mock.assert_called_once_with(path)
 
     # save_distributed_checkpoint=False, path exists, path is a file: no error (overwrite)
     path = tmp_path / "file.pt"
     path.touch()
     model = Mock(spec=nn.Module)
-    torch_save_mock.reset_mock()
+    atomic_save_mock.reset_mock()
     strategy.save_checkpoint(path=path, state={"model": model})
-    torch_save_mock.assert_called_once()
+    atomic_save_mock.assert_called_once()
 
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m), save_distributed_checkpoint=True)
     save_mock = mock.patch("torch.distributed.checkpoint.save")
@@ -205,7 +199,7 @@ def test_save_checkpoint_path_exists(shutil_mock, torch_save_mock, _, __, ___, t
     assert path.is_dir()
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_save_checkpoint_one_dist_module_required(tmp_path):
     """Test that the ModelParallelStrategy strategy can only save one distributed model per checkpoint."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
@@ -226,29 +220,7 @@ def test_save_checkpoint_one_dist_module_required(tmp_path):
             strategy.save_checkpoint(path=tmp_path, state={"model1": model1, "model2": model2})
 
 
-@RunIf(min_torch="2.3")
-@mock.patch("lightning.fabric.strategies.model_parallel.torch.load", Mock())
-@mock.patch("lightning.fabric.strategies.model_parallel._TORCH_GREATER_EQUAL_2_4", False)
-def test_load_full_checkpoint_support(tmp_path):
-    """Test that loading non-distributed checkpoints into distributed models requires PyTorch >= 2.4."""
-    strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
-    model = Mock(spec=nn.Module)
-    model.parameters.return_value = [torch.zeros(2, 1)]
-    path = tmp_path / "full.ckpt"
-    path.touch()
-
-    with pytest.raises(ImportError, match="Loading .* into a distributed model requires PyTorch >= 2.4"), mock.patch(
-        "lightning.fabric.strategies.model_parallel._has_dtensor_modules", return_value=True
-    ):
-        strategy.load_checkpoint(path=path, state={"model": model})
-
-    with pytest.raises(ImportError, match="Loading .* into a distributed model requires PyTorch >= 2.4"), mock.patch(
-        "lightning.fabric.strategies.model_parallel._has_dtensor_modules", return_value=True
-    ):
-        strategy.load_checkpoint(path=path, state=model)
-
-
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_load_checkpoint_no_state(tmp_path):
     """Test that the ModelParallelStrategy strategy can't load the full state without access to a model instance from
     the user."""
@@ -259,7 +231,7 @@ def test_load_checkpoint_no_state(tmp_path):
         strategy.load_checkpoint(path=tmp_path, state={})
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 @mock.patch("lightning.fabric.strategies.model_parallel.ModelParallelStrategy.broadcast", lambda _, x: x)
 @mock.patch("lightning.fabric.strategies.model_parallel.torch.load", Mock())
 def test_load_checkpoint_one_dist_module_required(tmp_path):
@@ -289,7 +261,7 @@ def test_load_checkpoint_one_dist_module_required(tmp_path):
     strategy.load_checkpoint(path=path, state=model)
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 @mock.patch("lightning.fabric.strategies.model_parallel._has_dtensor_modules", return_value=True)
 def test_load_unknown_checkpoint_type(_, tmp_path):
     """Test that the strategy validates the contents at the checkpoint path."""
@@ -301,7 +273,7 @@ def test_load_unknown_checkpoint_type(_, tmp_path):
         strategy.load_checkpoint(path=path, state={"model": model})
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_load_raw_checkpoint_validate_single_file(tmp_path):
     """Test that we validate the given checkpoint is a single file when loading a raw PyTorch state-dict checkpoint."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
@@ -312,7 +284,7 @@ def test_load_raw_checkpoint_validate_single_file(tmp_path):
         strategy.load_checkpoint(path=path, state=model)
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_load_raw_checkpoint_optimizer_unsupported(tmp_path):
     """Validate that the ModelParallelStrategy strategy does not yet support loading the raw PyTorch state-dict for an
     optimizer."""
@@ -324,7 +296,7 @@ def test_load_raw_checkpoint_optimizer_unsupported(tmp_path):
         strategy.load_checkpoint(path=tmp_path, state=optimizer)
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 @mock.patch("lightning.fabric.strategies.model_parallel._setup_device_mesh")
 @mock.patch("torch.distributed.init_process_group")
 def test_set_timeout(init_process_group_mock, _):
@@ -339,11 +311,15 @@ def test_set_timeout(init_process_group_mock, _):
     global_rank = strategy.cluster_environment.global_rank()
     world_size = strategy.cluster_environment.world_size()
     init_process_group_mock.assert_called_with(
-        process_group_backend, rank=global_rank, world_size=world_size, timeout=test_timedelta
+        process_group_backend,
+        rank=global_rank,
+        world_size=world_size,
+        timeout=test_timedelta,
+        device_id=None,
     )
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_meta_device_materialization():
     """Test that the `setup_module()` method materializes meta-device tensors in the module."""
 
@@ -377,3 +353,78 @@ def test_meta_device_materialization():
         model = strategy.setup_module(model)
     assert all(not p.is_meta for p in model.parameters())
     assert all(not b.is_meta for b in model.buffers())
+
+
+@RunIf(min_torch="2.4")
+def test_model_parallel_save_checkpoint_does_not_corrupt_remote_path(monkeypatch):
+    """Regression: a gs:// URL must reach the DCP layer uncorrupted (not gs:/)."""
+    from lightning.fabric.strategies import model_parallel as mp
+
+    captured = {}
+    monkeypatch.setattr(mp, "_has_dtensor_modules", lambda m: True)
+    monkeypatch.setattr(mp, "_distributed_checkpoint_save", lambda state, path: captured.update(path=path))
+    monkeypatch.setattr(mp, "_prepare_directory_checkpoint", lambda p: None)
+    monkeypatch.setattr(mp, "_is_checkpoint_dir", lambda p: False)
+    monkeypatch.setattr(mp, "_atomic_save", lambda obj, path: captured.update(meta=str(path)))
+    monkeypatch.setattr(
+        "torch.distributed.checkpoint.state_dict.get_model_state_dict", lambda obj, options=None: {"w": 1}
+    )
+
+    model = nn.Linear(2, 2)
+    mp._save_checkpoint(path="gs://bucket/run/ckpt", state={"model": model}, full_state_dict=False, rank=0)
+    assert captured["path"] == "gs://bucket/run/ckpt"
+    assert captured["meta"] == "gs://bucket/run/ckpt/meta.pt"
+
+
+@RunIf(min_torch="2.4")
+def test_model_parallel_load_checkpoint_does_not_corrupt_remote_path(monkeypatch):
+    """Regression: on load, a gs:// URL must reach the DCP/metadata layer uncorrupted (not gs:/)."""
+    from lightning.fabric.strategies import model_parallel as mp
+
+    captured = {}
+    monkeypatch.setattr(mp, "_has_dtensor_modules", lambda m: isinstance(m, nn.Module))
+    monkeypatch.setattr(mp, "_is_sharded_checkpoint", lambda p: True)
+    monkeypatch.setattr(mp, "_is_full_checkpoint", lambda p: False)
+    monkeypatch.setattr(mp, "_distributed_checkpoint_load", lambda state, path: captured.update(path=path))
+    monkeypatch.setattr(mp, "_load", lambda path, weights_only=None: captured.update(meta=str(path)) or {})
+    monkeypatch.setattr("torch.distributed.checkpoint.state_dict.get_model_state_dict", lambda module: {})
+
+    model = nn.Linear(2, 2)
+    mp._load_checkpoint(path="gs://bucket/run/ckpt", state={"model": model}, strict=False)
+    assert captured["path"] == "gs://bucket/run/ckpt"
+    assert captured["meta"] == "gs://bucket/run/ckpt/meta.pt"
+
+
+class _NonTensorMeta:
+    """A non-tensor, picklable object that ``weights_only=True`` unpickling rejects."""
+
+    def __init__(self, value):
+        self.value = value
+
+
+@RunIf(min_torch="2.4")
+def test_model_parallel_load_checkpoint_loads_non_tensor_metadata(monkeypatch, tmp_path):
+    """Regression: sharded-checkpoint metadata holding non-tensor objects must load on torch>=2.6.
+
+    ``torch.load``/``_load`` default to ``weights_only=True`` on torch>=2.6, which rejects arbitrary
+    pickled objects. ``_load_checkpoint`` must default to ``weights_only=False`` (like the FSDP strategy)
+    so metadata such as callback/loop state round-trips.
+    """
+    from lightning.fabric.strategies import model_parallel as mp
+    from lightning.fabric.utilities.cloud_io import _atomic_save
+    from lightning.fabric.utilities.load import _METADATA_FILENAME
+
+    ckpt_dir = tmp_path / "sharded-checkpoint"
+    ckpt_dir.mkdir()
+    _atomic_save({"user_meta": _NonTensorMeta(42)}, ckpt_dir / _METADATA_FILENAME)
+    assert _is_sharded_checkpoint(ckpt_dir)
+
+    monkeypatch.setattr(mp, "_has_dtensor_modules", lambda m: isinstance(m, nn.Module))
+    monkeypatch.setattr(mp, "_distributed_checkpoint_load", lambda state, path: None)
+    monkeypatch.setattr("torch.distributed.checkpoint.state_dict.get_model_state_dict", lambda module: {})
+
+    model = nn.Linear(2, 2)
+    state = {"model": model, "user_meta": None}
+    mp._load_checkpoint(path=ckpt_dir, state=state, strict=False)
+    assert isinstance(state["user_meta"], _NonTensorMeta)
+    assert state["user_meta"].value == 42

@@ -11,16 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from lightning.pytorch import LightningModule, Trainer, seed_everything
-from lightning.pytorch.demos.boring_classes import BoringModel, RandomDataset
-from lightning.pytorch.strategies import ModelParallelStrategy
 from torch.utils.data import DataLoader, DistributedSampler
 from torchmetrics.classification import Accuracy
 
+from lightning.pytorch import LightningModule, Trainer, seed_everything
+from lightning.pytorch.demos.boring_classes import BoringModel, RandomDataset
+from lightning.pytorch.strategies import ModelParallelStrategy
 from tests_pytorch.helpers.runif import RunIf
 
 
@@ -71,14 +74,29 @@ def _parallelize_feed_forward_fsdp2(model, device_mesh):
 
 def _parallelize_feed_forward_fsdp2_tp(model, device_mesh):
     model = _parallelize_feed_forward_tp(model, device_mesh)
-    model = _parallelize_feed_forward_fsdp2(model, device_mesh)
-    return model
+    return _parallelize_feed_forward_fsdp2(model, device_mesh)
+
+
+def _parallelize_with_compile(parallelize):
+    def fn(model, device_mesh):
+        model = parallelize(model, device_mesh)
+        return torch.compile(model)
+
+    return fn
+
+
+@pytest.fixture
+def distributed():
+    yield
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 class TemplateModel(LightningModule):
-    def __init__(self):
+    def __init__(self, compile=False):
         super().__init__()
         self.model = FeedForward()
+        self._compile = compile
 
     def training_step(self, batch):
         output = self.model(batch)
@@ -95,21 +113,57 @@ class TemplateModel(LightningModule):
 
 class FSDP2Model(TemplateModel):
     def configure_model(self):
-        _parallelize_feed_forward_fsdp2(self.model, device_mesh=self.device_mesh)
+        parallelize = _parallelize_feed_forward_fsdp2_tp
+        if self._compile:
+            parallelize = _parallelize_with_compile(parallelize)
+        parallelize(self.model, device_mesh=self.device_mesh)
 
 
 class TensorParallelModel(TemplateModel):
     def configure_model(self):
-        _parallelize_feed_forward_tp(self.model, device_mesh=self.device_mesh)
+        parallelize = _parallelize_feed_forward_tp
+        if self._compile:
+            parallelize = _parallelize_with_compile(parallelize)
+        parallelize(self.model, device_mesh=self.device_mesh)
 
 
 class FSDP2TensorParallelModel(TemplateModel):
     def configure_model(self):
-        _parallelize_feed_forward_fsdp2_tp(self.model, device_mesh=self.device_mesh)
+        parallelize = _parallelize_feed_forward_fsdp2_tp
+        if self._compile:
+            parallelize = _parallelize_with_compile(parallelize)
+        parallelize(self.model, device_mesh=self.device_mesh)
 
 
-@RunIf(min_torch="2.3", standalone=True, min_cuda_gpus=4)
-def test_setup_device_mesh():
+class SimpleCompiledModule(LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 32))
+        self._loss = nn.MSELoss()
+
+    def configure_model(self):
+        self.model = torch.compile(self.model)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        preds = self.model(x)
+        return self._loss(preds, y)
+
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.parameters(), lr=1e-3)
+
+
+def _compiled_model_dataloader(batch_size: int = 32, num_batches: int = 2):
+    total_samples = batch_size * num_batches
+    generator = torch.Generator().manual_seed(0)
+    features = torch.randn(total_samples, 32, generator=generator)
+    targets = torch.randn(total_samples, 32, generator=generator)
+    dataset = torch.utils.data.TensorDataset(features, targets)
+    return DataLoader(dataset, batch_size=batch_size)
+
+
+@RunIf(min_torch="2.4", standalone=True, min_cuda_gpus=4)
+def test_setup_device_mesh(distributed):
     from torch.distributed.device_mesh import DeviceMesh
 
     for dp_size, tp_size in ((1, 4), (4, 1), (2, 2)):
@@ -165,8 +219,12 @@ def test_setup_device_mesh():
     trainer.fit(model)
 
 
-@RunIf(min_torch="2.3", standalone=True, min_cuda_gpus=2)
-def test_tensor_parallel():
+@RunIf(min_torch="2.4", standalone=True, min_cuda_gpus=2)
+@pytest.mark.parametrize(
+    "compile",
+    [True, False],
+)
+def test_tensor_parallel(distributed, compile):
     from torch.distributed._tensor import DTensor
 
     class Model(TensorParallelModel):
@@ -201,13 +259,55 @@ def test_tensor_parallel():
 
     seed_everything(0)
     with trainer.init_module(empty_init=True):
-        model = Model()
+        model = Model(compile=compile)
 
     trainer.fit(model)
 
 
-@RunIf(min_torch="2.3", standalone=True, min_cuda_gpus=4)
-def test_fsdp2_tensor_parallel():
+@RunIf(min_torch="2.4", standalone=True, min_cuda_gpus=2)
+def test_model_parallel_single_file_checkpoint_with_compile(distributed, tmp_path):
+    """Replicate the reporter's setup: compiled model + ModelParallel single-file checkpointing."""
+
+    seed_everything(0)
+    strategy = ModelParallelStrategy(
+        data_parallel_size=1,
+        tensor_parallel_size=1,
+        save_distributed_checkpoint=False,
+    )
+
+    trainer = Trainer(
+        accelerator="auto",
+        devices=1,
+        strategy=strategy,
+        max_steps=2,
+        limit_train_batches=2,
+        enable_checkpointing=False,
+        logger=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        default_root_dir=tmp_path,
+    )
+
+    dataloader = _compiled_model_dataloader(batch_size=32, num_batches=2)
+
+    with trainer.init_module(empty_init=True):
+        model = SimpleCompiledModule()
+
+    trainer.fit(model, dataloader)
+
+    if trainer.is_global_zero:
+        checkpoint_path = tmp_path / "compiled-model.ckpt"
+        trainer.save_checkpoint(checkpoint_path)
+
+    trainer.strategy.barrier()
+
+
+@RunIf(min_torch="2.4", standalone=True, min_cuda_gpus=4)
+@pytest.mark.parametrize(
+    "compile",
+    [True, False],
+)
+def test_fsdp2_tensor_parallel(distributed, compile):
     from torch.distributed._tensor import DTensor
 
     class Model(FSDP2TensorParallelModel):
@@ -258,13 +358,13 @@ def test_fsdp2_tensor_parallel():
 
     seed_everything(0)
     with trainer.init_module(empty_init=True):
-        model = Model()
+        model = Model(compile=compile)
 
     trainer.fit(model)
 
 
-@RunIf(min_torch="2.3", min_cuda_gpus=2, standalone=True)
-def test_modules_without_parameters(tmp_path):
+@RunIf(min_torch="2.4", min_cuda_gpus=2, standalone=True)
+def test_modules_without_parameters(distributed, tmp_path):
     """Test that TorchMetrics get moved to the device despite not having any parameters."""
 
     class MetricsModel(TensorParallelModel):
@@ -294,7 +394,7 @@ def test_modules_without_parameters(tmp_path):
     trainer.fit(model)
 
 
-@RunIf(min_torch="2.3", min_cuda_gpus=2, standalone=True)
+@RunIf(min_torch="2.4", min_cuda_gpus=2, standalone=True)
 @pytest.mark.parametrize(
     ("precision", "expected_dtype"),
     [
@@ -303,7 +403,11 @@ def test_modules_without_parameters(tmp_path):
         pytest.param("bf16-true", torch.bfloat16, marks=RunIf(bf16_cuda=True)),
     ],
 )
-def test_module_init_context(precision, expected_dtype, tmp_path):
+@pytest.mark.parametrize(
+    "compile",
+    [True, False],
+)
+def test_module_init_context(distributed, compile, precision, expected_dtype, tmp_path):
     """Test that the module under the init-context gets moved to the right device and dtype."""
 
     class Model(FSDP2Model):
@@ -326,7 +430,7 @@ def test_module_init_context(precision, expected_dtype, tmp_path):
             logger=False,
         )
         with trainer.init_module(empty_init=empty_init):
-            model = Model()
+            model = Model(compile=compile)
 
         # The model is on the CPU/meta-device until after `ModelParallelStrategy.setup()`
         assert model.model.w1.weight.device == expected_device
@@ -336,5 +440,173 @@ def test_module_init_context(precision, expected_dtype, tmp_path):
     # Case 1: No empty init
     _run_setup_assertions(empty_init=False, expected_device=torch.device("cpu"))
 
-    # Case 2: Empty-init with PyTorch >= 2.1 supports meta device
+    # Case 2: Empty-init with meta device
     _run_setup_assertions(empty_init=True, expected_device=torch.device("meta"))
+
+
+@RunIf(min_torch="2.4", min_cuda_gpus=2, skip_windows=True, standalone=True)
+@pytest.mark.parametrize("save_distributed_checkpoint", [True, False])
+def test_strategy_state_dict(distributed, tmp_path, save_distributed_checkpoint):
+    """Test that the strategy returns the correct state dict of the LightningModule."""
+    model = FSDP2Model()
+    correct_state_dict = model.state_dict()  # State dict before wrapping
+
+    strategy = ModelParallelStrategy(save_distributed_checkpoint=save_distributed_checkpoint)
+    trainer = Trainer(
+        default_root_dir=tmp_path,
+        accelerator="cuda",
+        devices=2,
+        strategy=strategy,
+        max_epochs=1,
+        barebones=True,
+    )
+    trainer.fit(model)
+
+    state_dict = trainer.strategy.lightning_module_state_dict()
+
+    if save_distributed_checkpoint:
+        # All ranks return a state dict
+        assert len(state_dict) > 0
+        # State dict should contain same keys as non-distributed state dict
+        assert list(state_dict.keys()) == list(correct_state_dict.keys())
+    else:
+        if trainer.global_rank != 0:
+            # The full state-dict is only returned on rank 0
+            assert len(state_dict) == 0
+            return
+        # State dict should contain same keys as non-distributed state dict
+        assert list(state_dict.keys()) == list(correct_state_dict.keys())
+
+
+@RunIf(min_torch="2.4", min_cuda_gpus=2, skip_windows=True, standalone=True)
+def test_load_full_state_checkpoint_into_regular_model(distributed, tmp_path):
+    """Test that a full-state checkpoint saved from a distributed model can be loaded back into a regular model."""
+
+    # Save a regular full-state checkpoint from a distributed model
+    model = FSDP2Model()
+    strategy = ModelParallelStrategy(save_distributed_checkpoint=False)
+    trainer = Trainer(
+        default_root_dir=tmp_path,
+        accelerator="gpu",
+        devices=2,
+        strategy=strategy,
+        max_epochs=1,
+        barebones=True,
+    )
+    trainer.fit(model)
+    model_path = tmp_path / "last.ckpt"
+    model_path = trainer.strategy.broadcast(model_path)
+    trainer.save_checkpoint(model_path)
+    model_state_dict = trainer.strategy.lightning_module_state_dict()
+    optimizer_state_dict = trainer.strategy.optimizer_state(model.optimizers())
+
+    if trainer.global_rank != 0:
+        assert len(model_state_dict) == 0
+        assert len(optimizer_state_dict) == 0
+
+    # Create a regular model and load the checkpoint into it
+    model = TemplateModel()
+    trainer = Trainer(default_root_dir=tmp_path, accelerator="gpu", devices=2, strategy="ddp", max_epochs=1)
+    trainer.fit(model, ckpt_path=model_path)
+    restored_model_state_dict = trainer.strategy.lightning_module_state_dict()
+    restored_optimizer_state_dict = trainer.strategy.optimizer_state(model.optimizers())
+
+    if trainer.global_rank == 0:
+        assert len(model_state_dict) == len(restored_model_state_dict)
+        assert len(optimizer_state_dict) == len(restored_optimizer_state_dict)
+        torch.testing.assert_close(model_state_dict, restored_model_state_dict, atol=0, rtol=0)
+        torch.testing.assert_close(optimizer_state_dict, restored_optimizer_state_dict, atol=0, rtol=0)
+    trainer.strategy.barrier()
+
+
+@pytest.mark.filterwarnings("ignore::FutureWarning")
+@RunIf(min_torch="2.4", min_cuda_gpus=2, skip_windows=True, standalone=True)
+def test_load_standard_checkpoint_into_distributed_model(distributed, tmp_path):
+    """Test that a regular checkpoint (weights and optimizer states) can be loaded into a distributed model."""
+
+    # Save a regular DDP checkpoint
+    model = TemplateModel()
+    trainer = Trainer(default_root_dir=tmp_path, accelerator="gpu", devices=2, strategy="ddp", max_epochs=1)
+    trainer.fit(model)
+    model_path = tmp_path / "last.ckpt"
+    model_path = trainer.strategy.broadcast(model_path)
+    trainer.save_checkpoint(model_path)
+    model_state_dict = trainer.strategy.lightning_module_state_dict()
+    optimizer_state_dict = trainer.strategy.optimizer_state(model.optimizers())
+
+    # Create a distributed model and load the checkpoint into it
+    model = FSDP2Model()
+    strategy = ModelParallelStrategy(save_distributed_checkpoint=False)
+    trainer = Trainer(
+        default_root_dir=tmp_path,
+        accelerator="gpu",
+        devices=2,
+        strategy=strategy,
+        max_epochs=1,
+        barebones=True,
+    )
+    trainer.fit(model, ckpt_path=model_path)
+    restored_model_state_dict = trainer.strategy.lightning_module_state_dict()
+    restored_optimizer_state_dict = trainer.strategy.optimizer_state(model.optimizers())
+
+    if trainer.global_rank != 0:
+        assert len(restored_model_state_dict) == 0
+        assert len(restored_optimizer_state_dict) == 0
+    if trainer.global_rank == 0:
+        assert len(model_state_dict) == len(restored_model_state_dict)
+        assert len(optimizer_state_dict) == len(restored_optimizer_state_dict)
+        torch.testing.assert_close(model_state_dict, restored_model_state_dict, atol=0, rtol=0)
+        torch.testing.assert_close(optimizer_state_dict, restored_optimizer_state_dict, atol=0, rtol=0)
+    trainer.strategy.barrier()
+
+
+@pytest.mark.filterwarnings("ignore::FutureWarning")
+@RunIf(min_torch="2.4", min_cuda_gpus=2, standalone=True)
+def test_save_load_sharded_state_dict(distributed, tmp_path):
+    """Test saving and loading with the distributed state dict format."""
+
+    class CheckpointModel(FSDP2Model):
+        def __init__(self, params_to_compare=None):
+            super().__init__()
+            self.params_to_compare = params_to_compare
+
+        def on_train_start(self):
+            if self.params_to_compare is None:
+                return
+            for p0, p1 in zip(self.params_to_compare, self.trainer.model.parameters()):
+                assert torch.equal(p0, p1.full_tensor())
+
+    seed_everything(0)
+
+    strategy = ModelParallelStrategy(save_distributed_checkpoint=True)
+    trainer_kwargs = {
+        "default_root_dir": tmp_path,
+        "accelerator": "cuda",
+        "devices": 2,
+        "max_epochs": 1,
+        "enable_progress_bar": False,
+        "enable_model_summary": False,
+        "logger": False,
+    }
+
+    # Initial training
+    model = CheckpointModel()
+    trainer = Trainer(**trainer_kwargs, strategy=strategy)
+    trainer.fit(model)
+    params_before = [p.full_tensor() for p in trainer.model.parameters()]
+
+    checkpoint_path = Path(trainer.strategy.broadcast(trainer.checkpoint_callback.best_model_path))
+    assert set(os.listdir(checkpoint_path)) == {"meta.pt", ".metadata", "__0_0.distcp", "__1_0.distcp"}
+
+    metadata = torch.load(checkpoint_path / "meta.pt", weights_only=True)
+    assert "pytorch-lightning_version" in metadata
+    assert len(metadata["callbacks"]) == 1  # model checkpoint callback
+    assert "state_dict" not in metadata
+    assert "optimizer_states" not in metadata
+
+    # Load checkpoint and continue training
+    trainer_kwargs.update(max_epochs=2)
+    model = CheckpointModel(params_to_compare=params_before)
+    strategy = ModelParallelStrategy(save_distributed_checkpoint=True)
+    trainer = Trainer(**trainer_kwargs, strategy=strategy)
+    trainer.fit(model, ckpt_path=checkpoint_path)

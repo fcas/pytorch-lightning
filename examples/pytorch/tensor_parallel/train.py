@@ -1,15 +1,16 @@
-import lightning as L
 import torch
 import torch.nn.functional as F
 from data import RandomTokenDataset
-from lightning.pytorch.strategies import ModelParallelStrategy
 from model import ModelArgs, Transformer
 from parallelism import parallelize
 from torch.distributed.tensor.parallel import loss_parallel
 from torch.utils.data import DataLoader
 
+import lightning as L
+from lightning.pytorch.strategies import ModelParallelStrategy
 
-class Llama2(L.LightningModule):
+
+class Llama3(L.LightningModule):
     def __init__(self):
         super().__init__()
         self.model_args = ModelArgs(vocab_size=32000)
@@ -27,8 +28,13 @@ class Llama2(L.LightningModule):
         inputs = batch[:, :-1]
         labels = batch[:, 1:]
         output = self.model(inputs)
+        # Optional: Parallelize loss computation across class dimension (see parallelism.py)
         with loss_parallel():
             return F.cross_entropy(output.reshape(-1, output.size(-1)), labels.reshape(-1))
+
+    def backward(self, *args, **kwargs):
+        with loss_parallel():
+            super().backward(*args, **kwargs)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.model.parameters(), lr=3e-3, foreach=True)
@@ -58,7 +64,7 @@ def train():
 
     # Initialize the model
     with trainer.init_module(empty_init=True):
-        model = Llama2()
+        model = Llama3()
 
     trainer.print(f"Number of model parameters: {sum(p.numel() for p in model.parameters()) / 1e9:.1f} B")
     trainer.print("Starting training ...")
@@ -66,7 +72,7 @@ def train():
     trainer.fit(model)
 
     trainer.print("Training successfully completed!")
-    trainer.print(f"Peak memory usage: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+    trainer.print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 
 if __name__ == "__main__":

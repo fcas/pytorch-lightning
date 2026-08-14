@@ -1,6 +1,6 @@
 ## Tensor Parallel and 2D Parallel
 
-This example shows how to apply tensor-parallelism to your model (here Llama 2 7B) with the `ModelParallelStrategy`, and how it can be combined with FSDP (2D parallelism).
+This example shows how to apply tensor-parallelism to your model (here Llama 3 7B) with the `ModelParallelStrategy`, and how it can be combined with FSDP (2D parallelism).
 PyTorch 2.3+ and a machine with at least 4 GPUs and 24 GB memory each are required to run this example.
 
 ```bash
@@ -45,5 +45,5 @@ Training successfully completed!
 Peak memory usage: 36.73 GB
 ```
 
-> \[!NOTE\]
+> [!NOTE]
 > The `ModelParallelStrategy` is experimental and subject to change. Report issues on [GitHub](https://github.com/Lightning-AI/pytorch-lightning/issues).

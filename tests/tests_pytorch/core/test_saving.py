@@ -1,11 +1,11 @@
 from unittest.mock import ANY, Mock
 
-import lightning.pytorch as pl
 import pytest
 import torch
+
+import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.demos.boring_classes import BoringDataModule, BoringModel
-
 from tests_pytorch.conftest import mock_cuda_count, mock_mps_count
 from tests_pytorch.helpers.runif import RunIf
 
@@ -39,7 +39,7 @@ def test_load_from_checkpoint_map_location_automatic(accelerator, tmp_path, monk
     create_boring_checkpoint(tmp_path, BoringModel(), accelerator=accelerator)
 
     # The checkpoint contains tensors with storage tag on the accelerator
-    checkpoint = torch.load(f"{tmp_path}/checkpoint.ckpt")
+    checkpoint = torch.load(f"{tmp_path}/checkpoint.ckpt", weights_only=True)
     assert checkpoint["state_dict"]["layer.weight"].device.type.startswith(accelerator)
 
     # Pretend that the accelerator is not available
@@ -113,7 +113,7 @@ def test_load_from_checkpoint_warn_on_empty_state_dict(tmp_path):
     """Test that checkpoints can be loaded with an empty state dict and that the appropriate warning is raised."""
     create_boring_checkpoint(tmp_path, BoringModel(), accelerator="cpu")
     # Now edit so the state_dict is empty
-    checkpoint = torch.load(tmp_path / "checkpoint.ckpt")
+    checkpoint = torch.load(tmp_path / "checkpoint.ckpt", weights_only=True)
     checkpoint["state_dict"] = {}
     torch.save(checkpoint, tmp_path / "checkpoint.ckpt")
 
@@ -154,3 +154,38 @@ def test_load_from_checkpoint_strict(strict, strict_loading, expected, tmp_path)
     else:
         model = LoadingModel.load_from_checkpoint(tmp_path / "checkpoint.ckpt", strict=strict)
         model.load_state_dict.assert_called_once_with(ANY, strict=expected)
+
+
+def test_load_from_checkpoint_blocks_untrusted_instantiator(tmp_path):
+    """A checkpoint pointing ``_instantiator`` at an arbitrary import target must be rejected, not executed."""
+    checkpoint = {
+        "state_dict": {},
+        "hyper_parameters": {"_instantiator": "os.system"},
+        "pytorch-lightning_version": pl.__version__,
+    }
+    ckpt_path = tmp_path / "malicious.ckpt"
+    torch.save(checkpoint, ckpt_path)
+
+    with pytest.raises(ValueError, match="not in the allowlist of trusted instantiators"):
+        BoringModel.load_from_checkpoint(ckpt_path, strict=False)
+
+
+def test_load_from_checkpoint_allows_lightning_instantiator(tmp_path, monkeypatch):
+    """An allowlisted instantiator is still resolved and used to build the model."""
+    import lightning.pytorch.cli as cli
+
+    instantiator = Mock(side_effect=lambda cls, kwargs: cls())
+    monkeypatch.setattr(cli, "instantiate_module", instantiator)
+
+    checkpoint = {
+        "state_dict": {},
+        "hyper_parameters": {"_instantiator": "lightning.pytorch.cli.instantiate_module"},
+        "pytorch-lightning_version": pl.__version__,
+    }
+    ckpt_path = tmp_path / "checkpoint.ckpt"
+    torch.save(checkpoint, ckpt_path)
+
+    # the allowlisted path resolves without raising and the instantiator is used to build the model
+    model = BoringModel.load_from_checkpoint(ckpt_path, strict=False)
+    assert isinstance(model, BoringModel)
+    instantiator.assert_called_once()

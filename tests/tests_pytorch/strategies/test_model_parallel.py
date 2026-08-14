@@ -20,27 +20,22 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
+
+from lightning.fabric.strategies.model_parallel import _is_sharded_checkpoint
 from lightning.pytorch import LightningModule
 from lightning.pytorch.plugins.environments import LightningEnvironment
 from lightning.pytorch.strategies import ModelParallelStrategy
-
 from tests_pytorch.helpers.runif import RunIf
 
 
-@mock.patch("lightning.pytorch.strategies.model_parallel._TORCH_GREATER_EQUAL_2_3", False)
-def test_torch_greater_equal_2_3():
-    with pytest.raises(ImportError, match="ModelParallelStrategy requires PyTorch 2.3 or higher"):
-        ModelParallelStrategy()
-
-
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_device_mesh_access():
     strategy = ModelParallelStrategy()
     with pytest.raises(RuntimeError, match="Accessing the device mesh .* not allowed"):
         _ = strategy.device_mesh
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 @pytest.mark.parametrize(
     ("num_nodes", "devices", "invalid_dp_size", "invalid_tp_size"),
     [
@@ -68,18 +63,7 @@ def test_validate_device_mesh_dimensions(num_nodes, devices, invalid_dp_size, in
         strategy.setup_environment()
 
 
-@RunIf(min_torch="2.3")
-def test_checkpoint_io_unsupported():
-    """Test that the ModelParallel strategy does not support the `CheckpointIO` plugin."""
-    strategy = ModelParallelStrategy()
-    with pytest.raises(NotImplementedError, match="does not use the `CheckpointIO` plugin"):
-        _ = strategy.checkpoint_io
-
-    with pytest.raises(NotImplementedError, match="does not support setting a `CheckpointIO` plugin"):
-        strategy.checkpoint_io = Mock()
-
-
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_fsdp_v1_modules_unsupported():
     """Test that the strategy won't allow setting up a module wrapped with the legacy FSDP API."""
     from torch.distributed.fsdp import FullyShardedDataParallel
@@ -95,11 +79,11 @@ def test_fsdp_v1_modules_unsupported():
     strategy._lightning_module = model
     strategy._accelerator = Mock()
 
-    with pytest.raises(TypeError, match="only supports the new FSDP2 APIs in PyTorch >= 2.3"):
+    with pytest.raises(TypeError, match="only supports the new FSDP2 APIs in PyTorch >= 2.4"):
         strategy.setup(Mock())
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_configure_model_required():
     class Model1(LightningModule):
         pass
@@ -124,7 +108,7 @@ def test_configure_model_required():
     strategy.setup(Mock())
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_save_checkpoint_storage_options(tmp_path):
     """Test that the strategy does not accept storage options for saving checkpoints."""
     strategy = ModelParallelStrategy()
@@ -134,22 +118,70 @@ def test_save_checkpoint_storage_options(tmp_path):
         strategy.save_checkpoint(checkpoint=Mock(), filepath=tmp_path, storage_options=Mock())
 
 
-@RunIf(min_torch="2.3")
-def test_save_checkpoint_path_exists():
-    pytest.skip("Checkpoint saving and loading not implemented")
+@RunIf(min_torch="2.4")
+@mock.patch("lightning.pytorch.strategies.model_parallel.ModelParallelStrategy.broadcast", lambda _, x: x)
+@mock.patch("lightning.fabric.plugins.io.torch_io._atomic_save")
+@mock.patch("lightning.pytorch.strategies.model_parallel._remove_checkpoint")
+def test_save_checkpoint_path_exists(remove_checkpoint_mock, atomic_save_mock, tmp_path):
+    strategy = ModelParallelStrategy(save_distributed_checkpoint=False)
+
+    # save_distributed_checkpoint=False, path exists, path is not a sharded checkpoint: error
+    path = tmp_path / "not-empty"
+    path.mkdir()
+    (path / "file").touch()
+    assert not _is_sharded_checkpoint(path)
+    with pytest.raises(IsADirectoryError, match="exists and is a directory"):
+        strategy.save_checkpoint(Mock(), filepath=path)
+
+    # save_distributed_checkpoint=False, path exists, path is a sharded checkpoint: no error (overwrite)
+    path = tmp_path / "sharded-checkpoint"
+    path.mkdir()
+    (path / "meta.pt").touch()
+    assert _is_sharded_checkpoint(path)
+    strategy.save_checkpoint(Mock(), filepath=path)
+    remove_checkpoint_mock.assert_called_once_with(path)
+
+    # save_distributed_checkpoint=False, path exists, path is a file: no error (overwrite)
+    path = tmp_path / "file.pt"
+    path.touch()
+    atomic_save_mock.reset_mock()
+    strategy.save_checkpoint(Mock(), filepath=path)
+    atomic_save_mock.assert_called_once()
+
+    strategy = ModelParallelStrategy(save_distributed_checkpoint=True)
+
+    save_mock = mock.patch("torch.distributed.checkpoint.save")
+
+    # save_distributed_checkpoint=True, path exists, path is a folder: no error (overwrite)
+    path = tmp_path / "not-empty-2"
+    path.mkdir()
+    (path / "file").touch()
+    with save_mock:
+        strategy.save_checkpoint({"state_dict": {}, "optimizer_states": {"": {}}}, filepath=path)
+    assert (path / "file").exists()
+
+    # save_distributed_checkpoint=True, path exists, path is a file: no error (overwrite)
+    path = tmp_path / "file-2.pt"
+    path.touch()
+    with save_mock:
+        strategy.save_checkpoint({"state_dict": {}, "optimizer_states": {"": {}}}, filepath=path)
+    assert path.is_dir()
 
 
-@RunIf(min_torch="2.3")
-def test_load_full_checkpoint_support():
-    pytest.skip("Checkpoint saving and loading not implemented")
+@RunIf(min_torch="2.4")
+@mock.patch("lightning.fabric.strategies.model_parallel._has_dtensor_modules", return_value=True)
+def test_load_unknown_checkpoint_type(_, tmp_path):
+    """Test that the strategy validates the contents at the checkpoint path."""
+    strategy = ModelParallelStrategy()
+    strategy.model = Mock()
+    strategy._lightning_module = Mock(strict_loading=True)
+    path = tmp_path / "empty_dir"  # neither a single file nor a directory with meta file
+    path.mkdir()
+    with pytest.raises(ValueError, match="does not point to a valid checkpoint"):
+        strategy.load_checkpoint(checkpoint_path=path)
 
 
-@RunIf(min_torch="2.3")
-def test_load_unknown_checkpoint_type():
-    pytest.skip("Checkpoint saving and loading not implemented")
-
-
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 @mock.patch("lightning.pytorch.strategies.model_parallel._setup_device_mesh")
 @mock.patch("torch.distributed.init_process_group")
 def test_set_timeout(init_process_group_mock, _):
@@ -165,11 +197,15 @@ def test_set_timeout(init_process_group_mock, _):
     global_rank = strategy.cluster_environment.global_rank()
     world_size = strategy.cluster_environment.world_size()
     init_process_group_mock.assert_called_with(
-        process_group_backend, rank=global_rank, world_size=world_size, timeout=test_timedelta
+        process_group_backend,
+        rank=global_rank,
+        world_size=world_size,
+        timeout=test_timedelta,
+        device_id=None,
     )
 
 
-@RunIf(min_torch="2.3")
+@RunIf(min_torch="2.4")
 def test_meta_device_materialization():
     """Test that the `setup()` method materializes meta-device tensors in the LightningModule."""
 
@@ -209,3 +245,100 @@ def test_meta_device_materialization():
         strategy.setup(Mock())
     assert all(not p.is_meta for p in model.parameters())
     assert all(not b.is_meta for b in model.buffers())
+
+
+@RunIf(min_torch="2.4")
+def test_align_compiled_param_names_with_module():
+    """Test that optimizer state dict keys are aligned with compiled submodule parameter names."""
+    from lightning.pytorch.strategies.model_parallel import _align_compiled_param_names_with_module
+
+    class SimpleModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Sequential(nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 32))
+
+        def forward(self, x):
+            return self.model(x)
+
+    # Test with compiled submodule
+    m = SimpleModule()
+    m.model = torch.compile(m.model)
+
+    # Simulate optimizer state dict without _orig_mod in keys (includes both state and param_groups)
+    state_dict = {
+        "state": {
+            "model.0.weight": {"step": 1},
+            "model.0.bias": {"step": 1},
+            "model.2.weight": {"step": 1},
+            "model.2.bias": {"step": 1},
+        },
+        "param_groups": [{"params": ["model.0.weight", "model.0.bias", "model.2.weight", "model.2.bias"], "lr": 0.01}],
+    }
+
+    result = _align_compiled_param_names_with_module(state_dict, m)
+
+    # Verify state keys now have _orig_mod inserted
+    expected_keys = {
+        "model._orig_mod.0.weight",
+        "model._orig_mod.0.bias",
+        "model._orig_mod.2.weight",
+        "model._orig_mod.2.bias",
+    }
+    assert set(result["state"].keys()) == expected_keys
+
+    # Verify param_groups params also have _orig_mod inserted
+    assert set(result["param_groups"][0]["params"]) == expected_keys
+
+    # Verify they match the module's named_parameters
+    param_names = {name for name, _ in m.named_parameters()}
+    assert set(result["state"].keys()) == param_names
+
+
+@RunIf(min_torch="2.4")
+def test_align_compiled_param_names_no_compile():
+    """Test that non-compiled modules pass through unchanged."""
+    from lightning.pytorch.strategies.model_parallel import _align_compiled_param_names_with_module
+
+    class SimpleModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Sequential(nn.Linear(32, 64), nn.Linear(64, 32))
+
+        def forward(self, x):
+            return self.model(x)
+
+    m = SimpleModule()  # Not compiled
+
+    state_dict = {
+        "state": {
+            "model.0.weight": {"step": 1},
+            "model.0.bias": {"step": 1},
+        }
+    }
+
+    result = _align_compiled_param_names_with_module(state_dict, m)
+
+    # Keys should be unchanged
+    assert set(result["state"].keys()) == {"model.0.weight", "model.0.bias"}
+
+
+@RunIf(min_torch="2.4")
+def test_model_parallel_pytorch_save_checkpoint_remote_path(monkeypatch):
+    """Regression: a gs:// URL must reach the DCP layer uncorrupted (not gs:/)."""
+    from lightning.pytorch.strategies import model_parallel as mp
+
+    strategy = ModelParallelStrategy()
+    strategy._save_distributed_checkpoint = True
+    monkeypatch.setattr(strategy, "broadcast", lambda x: x)
+    monkeypatch.setattr(type(strategy), "global_rank", property(lambda self: 0))
+
+    captured = {}
+    monkeypatch.setattr(mp, "_distributed_checkpoint_save", lambda state, path: captured.update(path=path))
+    monkeypatch.setattr(mp, "_prepare_directory_checkpoint", lambda p: None)
+    monkeypatch.setattr(mp, "_is_checkpoint_dir", lambda p: False)
+    monkeypatch.setattr(mp, "_atomic_save", lambda obj, path: captured.update(meta=str(path)))
+
+    checkpoint = {"state_dict": {"w": 1}, "optimizer_states": []}
+    strategy.save_checkpoint(checkpoint, "gs://bucket/run/ckpt")
+    assert captured["path"] == "gs://bucket/run/ckpt"
+    assert captured["meta"] == "gs://bucket/run/ckpt/meta.pt"
